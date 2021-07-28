@@ -124,9 +124,24 @@ impl Opt {
     }
     pub fn save_match(&self, json: &serde_json::Value, rule_filename: &str) -> Result<(), ()> {
         match &self.output {
+<<<<<<< HEAD
             Some(p) => match p.is_dir() {
                 true => fs::write(p.join(rule_filename), json.to_string()).map_err(|_e| ()),
                 false => fs::write(p, json.to_string()).map_err(|_e| ()),
+=======
+            Some(p) => match match p.is_dir() {
+                false => (
+                    fs::write(p, json.to_string()),
+                    fs::write(p, "\n".as_bytes()),
+                ),
+                true => (
+                    fs::write(p.join(rule_filename), json.to_string()),
+                    fs::write(p.join(rule_filename), "\n".as_bytes()),
+                ),
+            } {
+                (Ok(_), Ok(_)) => Ok(()),
+                _ => Err(()),
+>>>>>>> staging
             },
             None => {
                 println!("{}", json.to_string());
