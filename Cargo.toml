@@ -1,0 +1,12 @@
+[package]
+name = "tau-cli"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tau-engine = { version = "1.0", features = ["json"] }
+structopt = { version = "0.3", default-features = false }
+log = "0.4"
+serde_json = "1.0"
