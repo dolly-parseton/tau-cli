@@ -1,9 +1,7 @@
-use log::{error, info, warn};
-use serde_json::from_str;
 use std::{
     error::Error,
     fs,
-    io::{self, stdin, BufRead, Stdin},
+    io::{self, prelude::*, stdin, stdout, BufRead, Stdin, Stdout},
     path::PathBuf,
 };
 use structopt::StructOpt;
@@ -19,16 +17,22 @@ struct Opt {
     #[structopt(short, long, parse(from_os_str))]
     rules: Vec<PathBuf>,
 
-    /// Glob matching one or more Rule files, to be used as the input files.
+    /// Glob matching one or more Rule files, to be used as the input files. Rules must be '.yml' files.
     #[structopt(short, long, parse(from_os_str))]
     input: Option<Vec<PathBuf>>,
+
+    /// Overwrite the output files.
+    #[structopt(short = "f", long)]
+    overwrite: bool,
 
     /// Path to write all matches, if path points to a directory then matches are written to files named after the associated rules.
     #[structopt(short, long, parse(from_os_str))]
     output: Option<PathBuf>,
 
     #[structopt(skip)]
-    inner: Option<Input>,
+    inner_input: Option<Input>,
+    #[structopt(skip)]
+    inner_output: Option<Output>,
 }
 
 enum Input {
@@ -75,72 +79,132 @@ impl Iterator for Input {
     }
 }
 
+enum Output {
+    CommandLine(Stdout),
+    Files(Vec<(fs::File, String)>),
+}
+
 impl Opt {
-    pub fn validate_rules(mut self) -> Result<(Self, Vec<(Rule, String)>), ()> {
+    pub fn validate_rules(mut self) -> Result<(Self, Vec<(Rule, String)>), String> {
         //
         let mut validated_rules = Vec::new();
-        for path in self.rules.drain(..) {
-            match fs::read_to_string(&path) {
-                Ok(ref data) => match Rule::load(data) {
-                    Ok(r) => {
-                        if let Ok(true) = r.validate() {
-                            match path
-                                .as_path()
-                                .file_name()
-                                .map(|f| f.to_str().map(|s| s.to_string()))
-                                .flatten()
-                            {
-                                Some(f) => validated_rules.push((r, f)),
-                                None => return Err(()),
-                            }
-                        } else {
-                            warn!("Unable to validate rule from {}.", path.display())
-                        }
-                    }
-                    Err(_e) => warn!("Unable to generate rule from {}.", path.display()),
-                },
-                Err(_e) => warn!("Unable to read data from {}.", path.display()),
+        for path in self.rules.iter() {
+            let data = fs::read_to_string(&path)
+                .map_err(|_| format!("Unable to read data from {}.", path.display()))?;
+            let rule = match Rule::load(&data) {
+                Ok(r) => r,
+                Err(_) => {
+                    eprintln!("Unable to generate rule from {}.", path.display());
+                    continue;
+                }
+            };
+            if rule
+                .validate()
+                .map_err(|_| format!("Unable to validate {} as a rule", path.display()))?
+            {
+                match path
+                    .as_path()
+                    .file_name()
+                    .map(|f| {
+                        f.to_str()
+                            .map(|n| n.strip_suffix(".yml").map(|s| format!("{}.match", s)))
+                    })
+                    .flatten()
+                    .flatten()
+                {
+                    Some(f) => validated_rules.push((rule, f)),
+                    None => return Err(format!("Unable to validate {} as a rule", path.display())),
+                }
             }
         }
         //
-        self.inner = Some(match self.input {
+        self.inner_input = Some(match self.input {
             Some(ref mut v) => match v.pop() {
                 Some(p) => {
-                    let f = fs::File::open(&p).map_err(|_e| {
-                        warn!("Unable to validate rule from {}.", p.display());
-                        ()
-                    })?;
+                    let f = fs::File::open(&p)
+                        .map_err(|_e| format!("Unable to validate rule from {}.", p.display()))?;
                     Input::Files {
                         paths: v.clone(),
                         buffer: io::BufReader::new(f),
                     }
                 }
-                None => return Err(()),
+                None => {
+                    return Err(
+                        "No rule files provided, use -r or --rules to specify one or more rules"
+                            .into(),
+                    )
+                }
             },
             None => Input::CommandLine(stdin()),
         });
         //
-        Ok((self, validated_rules))
-    }
-    pub fn save_match(&self, json: &serde_json::Value, rule_filename: &str) -> Result<(), ()> {
-        match &self.output {
-            Some(p) => match match p.is_dir() {
-                false => (
-                    fs::write(p, json.to_string()),
-                    fs::write(p, "\n".as_bytes()),
-                ),
-                true => (
-                    fs::write(p.join(rule_filename), json.to_string()),
-                    fs::write(p.join(rule_filename), "\n".as_bytes()),
-                ),
-            } {
-                (Ok(_), Ok(_)) => Ok(()),
-                _ => Err(()),
+        self.inner_output = Some(match &self.output {
+            Some(p) => match p.is_dir() {
+                false => Output::Files(vec![(
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .append(true)
+                        .open(&p)
+                        .map_err(|_| format!("Could not create output file at {}", p.display()))?,
+                    "".into(),
+                )]),
+                true => {
+                    let mut files = Output::Files(Vec::new());
+                    for (_, filename) in validated_rules.iter() {
+                        if let Output::Files(ref mut v) = files {
+                            v.push(
+                                (fs::OpenOptions::new()
+                                    .write(true)
+                                    // Flags here ensure we're overwriting data not appending, this might tamper with match results
+                                    .create_new(!self.overwrite)
+                                    .create(self.overwrite)
+                                    .truncate(self.overwrite)
+                                    .open(p.join(filename))
+                                    .map_err(|e| match e.kind() {
+                                        io::ErrorKind::AlreadyExists => {
+                                            format!("{} already exists, either remove this file or re-run with the -f / --overwrite flag ", p.join(filename).display())
+                                        },
+                                        io::ErrorKind::NotFound => {
+                                            format!("Part of the path to {} does not exist", p.join(filename).display())
+                                        }
+                                        _ => format!("{:?}", e.kind()),
+                                    })?,filename.into())
+                            );
+                        }
+                    }
+                    files
+                }
             },
-            None => {
-                println!("{}", json.to_string());
+            None => Output::CommandLine(stdout()),
+        });
+        //
+        match validated_rules.is_empty() {
+            true => Err(format!(
+                "Could not validate any of the following rules: {:?}",
+                self.rules
+            )),
+            false => Ok((self, validated_rules)),
+        }
+    }
+    pub fn output_match(
+        &mut self,
+        json: &serde_json::Value,
+        rule_filename: &str,
+    ) -> Result<(), Option<io::Error>> {
+        match self.inner_output.as_mut() {
+            Some(Output::Files(o)) => {
+                for (ref mut file, filename) in o {
+                    if filename == rule_filename {
+                        writeln!(file, "{}", json.to_string()).map_err(Some)?;
+                    }
+                }
                 Ok(())
             }
+            Some(Output::CommandLine(ref mut stdout)) => {
+                writeln!(stdout, "{}", json.to_string()).map_err(Some)?;
+                Ok(())
+            }
+            None => Err(None),
         }
     }
 }
@@ -148,15 +212,18 @@ impl Opt {
 impl Iterator for Opt {
     type Item = Result<serde_json::Value, Box<dyn Error>>;
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.as_mut().map(|ref mut i| i.next()).flatten()
+        self.inner_input
+            .as_mut()
+            .map(|ref mut i| i.next())
+            .flatten()
     }
 }
 
 fn main() {
     let (mut opt, rules) = match Opt::from_args().validate_rules() {
         Ok(x) => x,
-        Err(()) => {
-            error!("Unable to read command line arguments");
+        Err(e) => {
+            eprintln!("{}", e);
             std::process::exit(0);
         }
     };
@@ -164,13 +231,15 @@ fn main() {
         match res {
             Ok(json) => {
                 for (rule, path) in rules.iter() {
-                    //
                     if rule.matches(&json) {
-                        opt.save_match(&json, &path);
+                        if let Err(Some(e)) = opt.output_match(&json, &path) {
+                            eprintln!("An error occured whilst outputting data, {}", e);
+                            std::process::exit(0);
+                        }
                     }
                 }
             }
-            Err(e) => error!("{}", e),
+            Err(e) => eprintln!("{}", e),
         }
     }
 }

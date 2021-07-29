@@ -1,0 +1,10 @@
+detection:
+  condition: int(a.b) == 1
+
+true_positives:
+- a:
+    b: 1
+
+true_negatives:
+- a:
+    b: 2
